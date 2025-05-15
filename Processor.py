@@ -43,10 +43,14 @@ from pmdarima.arima import ndiffs
 from matplotlib.axes import Axes
 from xgboost import XGBRegressor
 import pprint
+import joblib
+from catboost import CatBoostRegressor
+from sklearn.preprocessing import OrdinalEncoder
+
 class TimeSeriesProcessor:
     @staticmethod
     def remove_leading_zeros(series: pd.Series) -> pd.Series:
-        """Удаляет ведущие нулевые значения из временного ряда"""     
+        """Удаляет ведущие нулевые значения из временного ряда"""
         first_non_zero = series.ne(0).idxmax()
         cnt = int((first_non_zero - series.index[0]).days)
         if cnt >= 100:

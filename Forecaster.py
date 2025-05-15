@@ -1,37 +1,55 @@
+from Processor import *
+from Analyser import *
 
 class TimeSeriesClass(TimeSeriesProcessor):
-    def __init__(self, store, dates, prices):
+    def __init__(self, store, dates, prices, models_path):
         self.store = store
         self.dates = dates
         self.prices = prices
         self.product_ids = self.store.item_id.unique()
         self.forecast_windows = [7, 30, 90]
-        self.models_path = ""
-        self.forecaster = None
-        self.trend_model = None
-        self.training_length = None
+        self.report = {}
+        self.models_path = models_path
         warnings.filterwarnings("ignore", category=UserWarning)
 
-    def get_item_series(self, item_id: str) -> pd.Series:
+    def preprocess_item(self, item_id: str) -> pd.Series:
         """Формирует временной ряд продаж для указанного товара."""
-        item_data = self.store[self.store['item_id'] == item_id].copy()
+        features = self.add_features()
+        item_data = features[(features.item_id == item_id)]
         item_data['date_id'] = item_data['date_id'].astype(int)
-
         merged = item_data.merge(
-            self.dates[['date_id', 'date']],
-            on='date_id',
-            how='left'
+            self.store[['cnt', 'date_id', 'item_id']], 
+            how='left',
+            on=['date_id', 'item_id']
         )
+        merged.drop(['store_id', 'item_id', 'date_id', 'wm_yr_wk', 'year', 'month', 'index'], axis=1, inplace=True)
+
         merged['date'] = pd.to_datetime(merged['date'].astype(str))
-        merged = merged.set_index('date')['cnt']
-        merged.columns = ['target']
+        merged = merged.set_index('date')
+        merged.rename(columns={'cnt': 'target'}, inplace=True)
+
+        analyzer = TimeSeriesAnalysis()
+        report = analyzer.run_analysis(merged['target'], show_plots=False)
+
+        merged['target'] = self.preprocess(merged['target'])
+        if isinstance(merged, pd.Series):
+            merged = merged.to_frame(name='target')
         return merged
 
-    def smape_f(self, y_true, y_pred):
+    def add_features(self) -> pd.DataFrame:
+        """Объединяет данные дат и цен в единый DataFrame."""
+        new_merged = self.dates.merge(self.prices, how='left', on="wm_yr_wk")
+        return new_merged
+
+    def smape_f(
+        self,
+        actual: Union[np.ndarray, pd.Series, list],
+        predicted: Union[np.ndarray, pd.Series, list]
+        ) -> float:
       """Вычисляет симметричную среднюю абсолютную процентную ошибку (SMAPE)."""
       epsilon = 1e-8
-      numerator = np.abs(y_pred - y_true)
-      denominator = (np.abs(y_true) + np.abs(y_pred) + epsilon)
+      numerator = np.abs(predicted - actual)
+      denominator = (np.abs(actual) + np.abs(predicted) + epsilon)
       return 200 * np.mean(numerator / denominator)
 
     def calculate_metrics(
@@ -51,161 +69,135 @@ class TimeSeriesClass(TimeSeriesProcessor):
             return pd.DataFrame()
 
         mae = np.mean(np.abs(actual - predicted))
-        mape = np.mean(np.abs((actual - predicted) / actual)) * 100
         rmse = np.sqrt(np.mean((actual - predicted) ** 2))
         smape = self.smape_f(actual, predicted)
         metrics = {
             'MAE': mae,
-            'MAPE (%)': mape,
             'RMSE': rmse,
             'SMAPE': smape,
         }
 
         return metrics
 
-    def fit(self, ts, horizon, report):
-        """Обучение модели XGBoost с учетом тренда и сезонности."""
+    def fit(self, ts: pd.DataFrame) -> tuple:
+        """Обучение модели CatBoost с учетом тренда и сезонности."""
         y = ts['target']
         X = ts.drop(columns=['target']) if ts.shape[1] > 1 else None
 
-        # Удаление тренда при необходимости
-        self.trend_model = None
-        if report.get('trend') == 'exists':
-            y, self.trend_model = self.remove_trend(y, return_model=True)
+        trend_model = None
+        if self.report.get('trend') == 'exists':
+            y, trend_model = self.remove_trend(y)
 
-        # Создание оконных признаков
-        window_length = report.get('seasonality', {}).get('period', 14)
-        regressor = XGBRegressor(
-            n_estimators=500,
-            max_depth=5,
+        category_encoder = None
+        if X is not None:
+            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+            if len(cat_cols) > 0:
+                category_encoder = OrdinalEncoder(
+                    handle_unknown='use_encoded_value', 
+                    unknown_value=-1
+                )
+                X[cat_cols] = category_encoder.fit_transform(X[cat_cols])
+
+        window_length = self.report.get('seasonality', {}).get('period', 14)
+        regressor = CatBoostRegressor(
+            iterations=500,      
+            depth=5,            
             learning_rate=0.1,
             subsample=0.8,
-            random_state=42
+            random_seed=42,
+            verbose=0      
         )
-        self.forecaster = make_reduction(
+        forecaster = make_reduction(
             regressor,
             window_length=window_length,
             strategy="recursive"
         )
 
-        # Обучение модели
-        self.forecaster.fit(y, X=X)
-        return self.forecaster, self.trend_model
+        forecaster.fit(y, X=X)
+        return (forecaster, category_encoder), trend_model
 
-    def save_model(self, item_id, horizon):
+    def save_model(self, item_id: str, forecaster: Any, trend_model: Any) -> None:
         """Сохранение модели и связанных параметров."""
+        os.makedirs(self.models_path, exist_ok=True)
         model_dict = {
-            'forecaster': self.forecaster,
-            'trend_model': self.trend_model,
+            'forecaster': forecaster,
+            'trend_model': trend_model,
         }
-        model_path = os.path.join(self.models_path, f"xgboost_{item_name}.pkl")
+        model_path = os.path.join(self.models_path, f"xgboost_{item_id}.pkl")
         joblib.dump(model_dict, model_path)
-        return model_path
 
-    def load_model(self, model_path, item_id):
+    def load_model(self, item_id: str) -> tuple:
         """Загрузка сохраненной модели."""
         model_path = os.path.join(self.models_path, f"xgboost_{item_id}.pkl")
         model_dict = joblib.load(model_path)
-        self.forecaster = model_dict['forecaster']
-        self.trend_model = model_dict['trend_model']
-        return self.forecaster, self.trend_model
+        forecaster = model_dict['forecaster']
+        trend_model = model_dict['trend_model']
+        return forecaster, trend_model
 
-    def predict(self, horizon, X=None):
-        """Прогнозирование с использованием обученной модели."""
-        if self.forecaster is None:
+    def predict(self, X: pd.DataFrame, forecaster: tuple = None, trend_model: Any = None) -> pd.Series:
+        """Прогнозирование с использованием обученной модели и обработкой категориальных признаков."""
+        forecaster, category_encoder = forecaster
+        if forecaster is None:
             raise ValueError("Модель не загружена. Сначала обучите или загрузите модель.")
+        if X is not None and category_encoder is not None:
+            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+            if len(cat_cols) > 0:
+                X = X.copy()
+                X[cat_cols] = category_encoder.transform(X[cat_cols])
 
+        horizon = len(X)
         fh = ForecastingHorizon(np.arange(1, horizon + 1), is_relative=True)
-        forecast = self.forecaster.predict(fh, X=X)
+        
+        forecast = forecaster.predict(fh, X=X)
+        if trend_model is not None:
+            forecast = self.restore_trend(forecast, trend_model)
+        forecast_series = pd.Series(
+            forecast.values,
+            index=X.index[:len(forecast)],  
+            name='forecast'
+        )
+        
+        forecast_series = self.inverse_transform(forecast_series)
+        
+        return forecast_series
 
-        if self.trend_model is not None and self.training_length is not None:
-            forecast = self.restore_trend(forecast, self.trend_model, start=self.training_length)
-        return forecast
-
-    def remove_trend(self, y, return_model=False):
+    def remove_trend(self, y: pd.Series) -> tuple:
         """Удаляет линейный тренд из ряда"""
         time = np.arange(len(y)).reshape(-1, 1)
         model = LinearRegression().fit(time, y)
         trend = model.predict(time)
         y_detrended = y - trend
-        return (y_detrended, model) if return_model else y_detrended
+        return (y_detrended, model)
 
-    def restore_trend(self, y_detrended, model, start=0):
+    def restore_trend(self, y_detrended: pd.Series, model: Any, start: int = 0) -> pd.Series:
         """Восстанавливает тренд в прогнозных значениях."""
         time = np.arange(start, start + len(y_detrended)).reshape(-1, 1)
         trend = model.predict(time)
         return y_detrended + trend
 
-    def evaluate_models(
-        self,
-        ts: pd.DataFrame,
-        report: Dict[str, Any]
-        ) -> Dict[Tuple[str, int], Dict[str, float]]:
-        """Оценивает производительность моделей на разных горизонтах прогнозирования."""
-        models = {
-            'XGBoost': self.train_xgboost,
-        }
+    def train_test_split(self, ts: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Разделение данных на тестовые и тренировочные"""
+        hor_max = max(self.forecast_windows)
+        train = ts.iloc[:-hor_max]
+        test = ts.iloc[-hor_max:]
+        test = test.iloc[:horizon]
+        return train, test
 
+    def show_info(self, y_true: pd.Series, y_pred: pd.Series) -> dict:
+        """Визуализация данных и сбор метрик"""
+        y_true = self.inverse_transform(y_true)
+        fig, ax = plt.subplots(1, 1, figsize=(20, 8))
+        ax.plot(y_true.index, y_true, label='Тестовые данные', color='green')
+        ax.plot(y_pred.index, y_pred, label='Прогноз', color='red', linewidth=2)
         results = {}
-        for model_name, model in models.items():
-            fig, axes = plt.subplots(len(self.forecast_windows), 1, figsize=(25, 25))
-            if len(self.forecast_windows) == 1:
-                axes = [axes]
-            fig.suptitle(f'Прогнозы модели {model_name}', fontsize=16, y=1.01)
+        metrics = self.calculate_metrics(y_true, y_pred)
 
-            for idx, horizon in enumerate(self.forecast_windows):
-                if idx >= len(axes):
-                    break
-                ax = axes[idx]
-                if len(ts) < horizon:
-                    continue
-                hor_max = max(forecast_windows)
-                train = ts.iloc[:-hor_max]
-                test = ts.iloc[-hor_max:horizon]
+        ax.set_title(f'Горизонт: {len(y_true)} дней')
+        ax.legend()
+        ax.grid(True)
+        ax.set_xlabel('Дата')
+        ax.set_ylabel('Продажи')
 
-                forecast = model(train, horizon, report)
-
-                forecast_series = pd.Series(
-                    forecast.values,
-                    index=test.index[:len(forecast)],
-                    name='forecast'
-                )
-                test_target = self.inverse_transform(test['target'])
-                train_target = self.inverse_transform(train['target'][-horizon:])
-                forecast_series = self.inverse_transform(forecast_series)
-
-        def show_info(y_true, y_pred, item_id):
-            ax.plot(y_true.index, y_true['target'], label='Тестовые данные', color='green')
-            ax.plot(y_pred.index, y_pred, label='Прогноз', color='red', linewidth=2)
-
-            metrics = self.calculate_metrics(y_true['target'], y_pred)
-            results[(model_name, horizon)] = metrics
-
-            ax.set_title(f'Горизонт: {horizon} дней')
-            ax.legend()
-            ax.grid(True)
-            ax.set_xlabel('Дата')
-            ax.set_ylabel('Продажи')
-
-            plt.tight_layout()
-            plt.show()
-
-        return results
-
-    def full_analysis(self, product_id: str, show_plots: bool = False) -> None:
-        """Выполняет комплексный анализ и прогнозирование для указанного товара."""
-        print("Product ", product_id)
-        series = self.get_item_series(product_id)
-        analyzer = TimeSeriesAnalysis()
-        report = analyzer.run_analysis(series, show_plots)
-
-        clean_series = self.preprocess(series)
-        print(report)
-
-        if isinstance(clean_series, pd.Series):
-            clean_series = clean_series.to_frame(name='target')
-
-        res = (self.evaluate_models(clean_series, report))
-        pp = pprint.PrettyPrinter(depth=4)
-        pp.pprint(res)
-        return
+        plt.tight_layout()
+        plt.show()
+        return metrics
